@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from filelock import FileLock
 
-from nanochat.common import get_base_dir
+from FoxSay.common import get_base_dir
 
 
 class HubDataset:

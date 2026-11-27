@@ -25,14 +25,15 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
+from FoxSay.gpt import GPT, GPTConfig, Linear
+from FoxSay.optim import prepare_gradients
+from FoxSay.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from FoxSay.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from FoxSay.tokenizer import get_tokenizer, get_token_bytes
+from FoxSay.checkpoint_manager import save_checkpoint, load_checkpoint
+from FoxSay.loss_eval import evaluate_bpb
+from FoxSay.engine import Engine
+from FoxSay.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -46,12 +47,22 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# FSDP weight sharding (see FoxSay/fsdp/README.md)
+parser.add_argument("--fsdp", action="store_true", help="enable FSDP weight sharding: shards the weights themselves across ranks on top of the ZeRO-2 optimizer-state sharding (recommended for large models / many GPUs)")
+parser.add_argument("--fsdp-master-dtype", type=str, default="float32", choices=["float32", "float64"], help="master weight dtype under FSDP; float64 = bf16 compute + fp64 master/states (the 'precision to 64' mod)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--moe-experts", type=int, default=0, help="sparse experts per enabled layer; 0 preserves the dense model")
+parser.add_argument("--moe-top-k", type=int, default=1, help="active experts per token; no tokens are dropped")
+parser.add_argument("--moe-expert-ratio", type=float, default=4.0, help="expert hidden width / model width")
+parser.add_argument("--moe-every", type=int, default=1, help="use MoE every N layers (final layer included)")
+parser.add_argument("--loss-chunk-size", type=int, default=0, help="tokens per lm_head/loss chunk; 0 disables chunking")
+parser.add_argument("--loss-dtype", type=str, default="float32", choices=["float32", "float64"], help="logit and cross-entropy precision")
+parser.add_argument("--logit-softcap", type=float, default=15.0, help="tanh logit cap; <=0 disables saturation")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -64,6 +75,7 @@ parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learnin
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+parser.add_argument("--grad-clip", type=float, default=1.0, help="global gradient norm cap; 0 disables clipping but keeps finite checks")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -97,10 +109,10 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="FoxSay", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
+from FoxSay.flash_attention import USE_FA3
 using_fa3 = USE_FA3
 if using_fa3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
@@ -137,6 +149,10 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        moe_num_experts=args.moe_experts, moe_top_k=args.moe_top_k,
+        moe_expert_ratio=args.moe_expert_ratio, moe_every=args.moe_every,
+        loss_chunk_size=args.loss_chunk_size, loss_dtype=args.loss_dtype,
+        logit_softcap=args.logit_softcap,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -170,7 +186,7 @@ if args.fp8:
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
         # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        from FoxSay.fp8 import Float8LinearConfig, convert_to_float8_training
         # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
@@ -263,7 +279,8 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 def get_scaling_params(m):
     # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
     params_counts = m.num_scaling_params()
-    scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
+    # MoE token horizon follows active capacity, not dormant expert storage.
+    scaling_params = params_counts.get('transformer_active', params_counts['transformer_matrices']) + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
@@ -287,7 +304,7 @@ if total_batch_size == -1:
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF # B/B_ref
 if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
+    # SGD: linear scaling with batch size is standard (not used in FoxSay)
     # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
     # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
@@ -314,6 +331,20 @@ optimizer = model.setup_optimizer(
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
+
+# -----------------------------------------------------------------------------
+# FSDP weight sharding (optional): shards the weights themselves across ranks on
+# top of the ZeRO-2 optimizer-state sharding, so per-GPU memory becomes
+# O(params / world_size). See FoxSay/fsdp/README.md.
+fsdp_manager = None
+if args.fsdp:
+    assert COMPUTE_DTYPE != torch.float16, "FSDP does not support fp16/GradScaler training"
+    assert not args.fp8, "FSDP and --fp8 are mutually exclusive"
+    from FoxSay.fsdp import FullySharded
+    fsdp_master_dtype = {"float32": torch.float32, "float64": torch.float64}[args.fsdp_master_dtype]
+    fsdp_manager = FullySharded(orig_model, optimizer, master_dtype=fsdp_master_dtype)
+    fsdp_manager.shard()
+    optimizer = fsdp_manager.optimizer # FSDPMuonAdamW over the same param_groups
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -434,6 +465,8 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+        if fsdp_manager is not None:
+            fsdp_manager.free_all() # forward-only eval leaves params materialized; release the buffers
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -451,10 +484,14 @@ while True:
             "centered_results": results["centered_results"],
         })
         model.train()
+        if fsdp_manager is not None:
+            fsdp_manager.free_all()
 
-    # once in a while: sample from the model (only on master process)
+    # once in a while: sample from the model
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    # NOTE: under FSDP every forward pass issues collectives, so this block must run
+    # on ALL ranks (only rank0 prints, via print0). Removing master_process here.
+    if args.sample_every > 0 and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -472,13 +509,15 @@ while True:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
+        if fsdp_manager is not None:
+            fsdp_manager.free_all()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
+            fsdp_manager.consolidated_state_dict() if fsdp_manager is not None else orig_model.state_dict(), # model parameters (consolidated across FSDP shards)
             optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
@@ -528,15 +567,22 @@ while True:
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
-        scaler.update()
+    grads_ok = prepare_gradients(
+        (p for group in optimizer.param_groups for p in group["params"]),
+        max_norm=args.grad_clip,
+    )
+    if grads_ok:
+        if scaler is not None:
+            scaler.step(optimizer)
+        else:
+            optimizer.step()
     else:
-        optimizer.step()
+        print0(f"Step {step:05d} | skipped non-finite gradient update")
+    if scaler is not None:
+        scaler.update()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()

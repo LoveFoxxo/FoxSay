@@ -10,7 +10,7 @@ Default is all three: --eval core,bpb,sample
 
 Examples:
 
-    # Evaluate a nanochat model (e.g. d24) using 8 GPUs
+    # Evaluate a FoxSay model (e.g. d24) using 8 GPUs
     torchrun --nproc_per_node=8 -m scripts.base_eval --model-tag d24 --device-batch-size=16
 
     # Quick/approximate evaluation using a single GPU
@@ -28,13 +28,13 @@ import tempfile
 import argparse
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import load_model
-from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
+from FoxSay.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from FoxSay.tokenizer import get_token_bytes
+from FoxSay.checkpoint_manager import load_model
+from FoxSay.core_eval import evaluate_task
+from FoxSay.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from FoxSay.loss_eval import evaluate_bpb
+from FoxSay.engine import Engine
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -128,7 +128,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
-    parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
+    parser.add_argument('--model-tag', type=str, default=None, help='FoxSay model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')

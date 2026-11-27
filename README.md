@@ -1,230 +1,198 @@
-# nanochat
+# FoxSay
 
-![nanochat logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
+FoxSay 是一个可阅读、可修改、可端到端实验的双脑语言模型项目。它以 Andrej Karpathy 的 [nanochat](https://github.com/karpathy/nanochat) 为基础，保留分词、预训练、SFT、RL、评测和推理工具链，并加入时序右脑、胼胝体融合、稀疏 MoE、数值精度控制与权重分片。
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, and inference. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it over a simple CLI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
+> **边界说明**：双脑结构、HiPPO 和更高精度可以改善表达能力或数值稳定性，但不等价于生物人脑，也不保证任意任务上的误差趋零。本文中的“收敛”主要指浮点误差、梯度稳定性和优化过程；验证集误差仍取决于数据、优化、训练量和任务本身。
 
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
+## 主要组成
 
-## Time-to-GPT-2 Leaderboard
+| 模块 | 文件 | 作用 |
+|---|---|---|
+| 左脑 | `FoxSay/gpt.py` | Transformer、GQA、RoPE、值残差、可选内部验证回环与稀疏专家 |
+| 右脑 | `FoxSay/right_brain.py` | HiPPO-LegS 状态空间通道、Tustin 离散化、因果深度卷积、门控残差及流式状态 |
+| 胼胝体 | `FoxSay/corpus_callosum.py` | 在推理 Engine 中把右脑时序表示转换成 logits 偏移，与左脑输出相加 |
+| 稀疏扩容 | `FoxSay/moe.py` | Top-K 路由、无 token 丢弃、负载均衡辅助损失、router z-loss、完整梯度集合 |
+| 数值底座 | `FoxSay/numerics.py` | RMSNorm 在低精度输入下使用 fp32 累加，也支持 fp64 |
+| 优化与保护 | `FoxSay/optim.py` | Muon + AdamW、全局梯度裁剪、NaN/Inf 检查及分布式同步跳步 |
+| 权重分片 | `FoxSay/fsdp/` | ZeRO-2 之上的 FSDP 权重分片、主权重与优化器状态管理 |
+| 可选能力 | `FoxSay/gan/`、`FoxSay/mind/` | 内部验证器、循环门控、谱方法、记忆及其他实验模块 |
+| 输入与输出 | `FoxSay/inputs/`、`FoxSay/outputs/` | 文本、网页、多模态学习入口与 CLI/Web/媒体接口 |
+| 规模规划 | `FoxSay/scaling.py` | 在 meta 设备上统计双脑参数，不实际分配万亿参数显存 |
 
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
+### 双脑怎样协同
 
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
-| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
+1. 左脑产生最终隐藏状态和语言模型 logits。
+2. 右脑读取左脑隐藏状态的历史窗口，通过 HiPPO 与因果卷积提取时序特征。
+3. `CorpusCallosum` 将右脑表示投影为 logits 偏移，再加到左脑输出。
+4. 胼胝体的两个投影采用零初始化，因此未经训练的桥接层不会改变原有左脑输出。
 
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
+**当前 `scripts/base_train.py` 仍训练左脑 GPT，并没有自动联合训练左右脑。** 右脑提供独立的 `setup_optimizer()`、辅助损失和 FSDP 接口；Engine 中的胼胝体是推理融合路径。正式双脑训练还需要显式构造任务、组合损失与保存相应模块。
 
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
+## 环境安装
 
-## Getting started
-
-### Setup
-
-nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
+要求 Python 3.10 或更新版本，依赖由 [uv](https://docs.astral.sh/uv/) 管理。
 
 ```bash
-uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)
-uv sync --extra cpu    # (or) Use for CPU-only / MPS
+git clone https://github.com/LoveFoxxo/FoxSay.git
+cd FoxSay
+
+# CUDA（PyTorch CUDA 12.8 源）
+uv sync --extra gpu --group dev
+
+# 或 CPU / MPS；Windows 可使用 .venv/Scripts/activate
+uv sync --extra cpu --group dev
 source .venv/bin/activate
 ```
 
-For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
+`cpu` 与 `gpu` 是互斥选项。开发组提供 pytest 等测试依赖。需要严格使用锁文件时：
 
 ```bash
-uv sync --extra gpu --group dev
+uv lock --check
+uv sync --frozen --extra cpu --group dev
 ```
 
-### Reproduce and talk to GPT-2
+## 从数据到聊天
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+### 1. 下载数据并训练分词器
 
 ```bash
-bash runs/speedrun.sh
+# 下载 170 个 ClimbMix 数据分片；可按磁盘和训练规模减少
+python -m FoxSay.dataset -n 170
+
+# 训练 32768 词表的 BPE 分词器并计算 token_bytes
+python -m scripts.tok_train
+python -m scripts.tok_eval
 ```
 
-You may wish to do so in a screen session as this will take ~1.5 hours to run. Once it's done, you can talk to your model over the CLI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and chat:
+下载和训练会消耗大量网络、磁盘与内存；请先用较小 `-n`、`--max-chars` 验证流程。完整流水线也可参考 `runs/speedrun.sh`，该脚本面向多卡 GPU，不应直接用于资源有限的电脑。
+
+### 2. 左脑预训练
+
+小规模 CPU 冒烟实验：
 
 ```bash
-python -m scripts.chat_cli
+python -m scripts.base_train --depth=4 --max-seq-len=512 \
+  --device-batch-size=1 --total-batch-size=512 --num-iterations=20 \
+  --eval-tokens=512 --core-metric-every=-1 --sample-every=-1
 ```
 
-Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :). An example conversation with a speedrun model:
-
-> **User:** Hello whats up?
->
-> **Assistant:** Hello! How can I help you today?
->
-> **User:** Why is the sky blue?
->
-> **Assistant:** The sky is blue due to an optical illusion called the Rayleigh Scattering of Light, which occurs when sunlight passes through tiny particles in the air. These particles are made up of tiny blue and violet particles that cause the light to bend in a particular way.
->
-> **User:** That's cool. Write a poem about it.
->
-> **Assistant:** In the twilight's glow, the sky is blue,<br>
-> A canvas of shimmering blue, where skies unfold,<br>
-> A world of blue, where blue and more blue,<br>
-> Are woven together in a tapestry so fine,<br>
-> Where every hue seems to sing a story.<br>
-> ...
-
-A few more notes:
-
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
-
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
-```
-
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
-
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE score)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | Safe default. On recent macOS, MPS also runs `NANOCHAT_DTYPE=bfloat16` fine (~25% less memory, similar speed) |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
+8 卡训练及 FSDP 示例：
 
 ```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --depth=24 --device-batch-size=16 --run=d24
+
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+  --depth=24 --device-batch-size=16 --fsdp --fsdp-master-dtype=float64
 ```
 
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
+当单卡放不下时，优先减小 `--device-batch-size`、序列长度或模型深度。FSDP 的优化器检查点依赖恢复时的卡数；更多限制见 `FoxSay/fsdp/README.md`。
 
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
+### 3. SFT、评测与推理
 
-## Guides
-
-I've published a number of guides that might contain helpful information, most recent to least recent:
-
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
-
-## File structure
-
-```
-.
-├── LICENSE
-├── README.md
-├── dev
-│   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
-├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
-│   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-├── pyproject.toml
-├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
-├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── infer_bench.py              # Inference: latency/throughput/VRAM bench
-│   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
-│   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   └── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-├── tests
-│   ├── test_attention_fallback.py  # FA3/SDPA attention fallback
-│   ├── test_engine.py              # Inference engine, KV cache
-│   ├── test_execution.py           # Sandboxed code execution
-│   ├── test_optim.py               # MuonAdamW optimizer (needs GPU)
-│   ├── test_tasks.py               # Task slicing, mixtures, HubDataset
-│   └── test_tokenizer.py           # BPE round-trips, chat rendering
-└── uv.lock
+```bash
+python -m scripts.chat_sft
+python -m scripts.chat_eval -i sft
+python -m scripts.chat_cli -p "你好，FoxSay！"
+python -m scripts.infer_bench
 ```
 
-## Contributing
+多卡 SFT/RL 的启动方式见各脚本顶部说明。`--run=dummy` 可关闭 wandb 记录；非 dummy 运行前需自行配置 wandb。
 
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~1.5 hours (down from 3h), but by improving the pretraining stage we can improve this further.
+## 低误差与鲁棒训练开关
 
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
-
-## Acknowledgements
-
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
-
-## Cite
-
-If you find nanochat helpful in your research cite simply as:
-
-```bibtex
-@misc{nanochat,
-  author = {Andrej Karpathy},
-  title = {nanochat: The best ChatGPT that \$100 can buy},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/karpathy/nanochat}
-}
+```bash
+python -m scripts.base_train \
+  --moe-experts=8 --moe-top-k=1 --moe-expert-ratio=4 \
+  --loss-dtype=float64 --loss-chunk-size=128 --logit-softcap=0 \
+  --grad-clip=1.0
 ```
 
-## License
+- `--moe-experts=0`：保留原始稠密结构；大于零时在指定层启用稀疏专家。
+- `--moe-top-k`：每个 token 激活的专家数；当前实现不丢弃 token。
+- `--loss-dtype=float64`：提高 logits 与交叉熵的精度，会增加计算和内存开销。
+- `--loss-chunk-size`：分块计算语言模型头与损失，缓解完整 logits 的瞬时内存。
+- `--logit-softcap=0`：关闭 tanh logits 饱和；关闭后需依靠梯度保护与训练监控控制异常值。
+- `--grad-clip`：全局梯度范数裁剪；检测到非有限梯度时同步跳过更新。
 
-MIT
+还可通过 `NANOCHAT_DTYPE=float64` 提高整条计算链精度。它不是免费升级：GPU 吞吐、显存和硬件 fp64 能力都可能成为瓶颈，且更高浮点精度不能消除数据噪声、局部最优或泛化误差。
+
+## 近万亿双脑预设
+
+```python
+from FoxSay.scaling import trillion_dual_configs, dual_parameter_report
+
+left_config, right_config = trillion_dual_configs()
+print(dual_parameter_report(left_config, right_config))
+```
+
+该预设使用 64 层、8192 维宽度，两侧均配置 14 个专家、Top-1 激活；元设备统计结果为：
+
+| 口径 | 左脑 | 右脑 | 合计 |
+|---|---:|---:|---:|
+| 总参数 | 492,318,002,586 | 485,409,423,360 | 977,727,425,946 |
+| 单 token 激活参数上限 | 45,641,403,802 | 38,732,824,576 | 84,374,228,378 |
+
+“激活参数上限”排除了未被 Top-1 路由选中的专家参数，不代表实际显存占用。此预设是**架构与分片规划，不是单机可训练承诺**：真正落地仍需专家并行、流式初始化、通信与检查点设计，以及 Linux/NCCL 集群上的系统验证。当前 FSDP 会分片存储，但专家前向仍有 gather/广播成本。
+
+直接构造左、右脑的接口：
+
+```python
+from FoxSay.gpt import GPT, GPTConfig
+from FoxSay.right_brain import RightBrain, mirror_left
+
+left_config = GPTConfig(n_layer=4, n_embd=256, n_head=4, n_kv_head=4)
+right_config = mirror_left(left_config, ssm_state=16, conv_kernel=7)
+# 在目标训练脚本中显式初始化、组合损失并保存两个模型。
+```
+
+## 包改名与兼容性
+
+核心 Python 包已从 `nanochat` 改为 **`FoxSay`**，脚本、测试、notebook 和 Shell 中的导入路径已同步更新：
+
+```python
+from FoxSay.gpt import GPT, GPTConfig
+from FoxSay.engine import Engine
+```
+
+旧 `import nanochat` / `from nanochat ...` 不再作为包名提供，外部代码需改为 `FoxSay`。包名区分大小写，Linux 上尤其如此。
+
+为避免已有数据与 checkpoint 失效，以下接口暂时保留旧名称：
+
+- `NANOCHAT_DTYPE`、`NANOCHAT_BASE_DIR` 环境变量；
+- 默认缓存目录 `~/.cache/nanochat`；
+- 既有 checkpoint 中的模块字段结构（本次是包目录改名，不是模型参数重命名）。
+
+历史文档和指向上游 Karpathy 仓库的 URL 保留 `nanochat`，它们不是失效导入。
+
+## 测试与已知限制
+
+```bash
+python -m compileall -q FoxSay scripts tests tasks
+python -m pytest -q
+
+# 未安装 MSVC 的 Windows 环境可禁用 Dynamo 后运行非沙箱、非多进程集合
+TORCHDYNAMO_DISABLE=1 python -m pytest -q \
+  --ignore=tests/test_execution.py -k "not test_fsdp_multi_rank"
+```
+
+Windows 上未配置进程沙箱或多进程 Gloo 时，相关测试可能失败，应修复运行环境，而不是跳过失败后宣称通过。GPU、FSDP 多 rank、真实数据训练及万亿预设需要对应硬件与后端；小规模单元测试通过不代表这些场景已经完成验收。
+
+提交前建议运行 `git diff --check`。虚拟环境、缓存、本地 dry-run 和构建产物由 `.gitignore` 排除。
+
+## 目录速览
+
+```text
+FoxSay/                 核心包（双脑、MoE、优化器、分片、I/O、实验模块）
+scripts/                数据、训练、评测与推理命令
+runs/                   可配置的 Shell 实验流水线
+tasks/                  CORE/SFT/RL 任务
+tests/                  单元、数值、分片与接口测试
+dev/                    上游历史、实验记录和分析 notebook
+pyproject.toml          项目、依赖和 setuptools 包发现配置
+uv.lock                 锁定依赖
+```
+
+## 来源与许可
+
+FoxSay 基于 [karpathy/nanochat](https://github.com/karpathy/nanochat) 改造，感谢原作者及相关开源项目。项目继续采用 MIT 许可，完整条款与上游版权声明见 `LICENSE`。`dev/LOG.md`、`dev/LEADERBOARD.md` 保留上游实验历史，不应视为 FoxSay 当前硬件上的复现结果。

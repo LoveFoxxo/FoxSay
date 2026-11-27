@@ -39,9 +39,9 @@ import json
 import time
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, autodetect_device_type, get_peak_bandwidth, get_peak_flops
-from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from FoxSay.common import compute_init, compute_cleanup, autodetect_device_type, get_peak_bandwidth, get_peak_flops
+from FoxSay.checkpoint_manager import load_model
+from FoxSay.engine import Engine
 
 # -----------------------------------------------------------------------------
 # Measurement

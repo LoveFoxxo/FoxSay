@@ -8,7 +8,7 @@ python -m pytest tests/test_execution.py -v
 import os
 import time
 import pytest
-from nanochat.execution import execute_code
+from FoxSay.execution import execute_code
 
 
 def test_happy_path():

@@ -5,7 +5,7 @@ It is a coding benchmark.
 """
 
 import re
-from nanochat.execution import execute_code
+from FoxSay.execution import execute_code
 from tasks.common import Task, load_hub_dataset
 
 def extract_imports(prompt):

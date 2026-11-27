@@ -6,9 +6,9 @@ import os
 import time
 import argparse
 import torch
-from nanochat.tokenizer import RustBPETokenizer
-from nanochat.common import get_base_dir
-from nanochat.dataset import parquets_iter_batched
+from FoxSay.tokenizer import RustBPETokenizer
+from FoxSay.common import get_base_dir
+from FoxSay.dataset import parquets_iter_batched
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments

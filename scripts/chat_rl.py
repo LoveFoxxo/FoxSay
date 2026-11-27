@@ -9,6 +9,19 @@ simpler and more similar to just REINFORCE:
 3) We use DAPO style normalization that is token-level, not sequence-level.
 4) Instead of z-score normalization (r - mu)/sigma, only use (r - mu) as the advantage.
 
+NEW (internal verification loop + adversarial reward, see FoxSay/gan):
+5) The reward is a composite: task outcome (binary) + verifier PRM process
+   reward + adversarial discriminator score + cycle-efficiency shaping.
+   Truncation no longer zeroes the reward - it only subtracts a small penalty,
+   so the "think longer, get punished" bias of the old 256-token clip is gone.
+6) The adversarial verifier is trained online against the policy's own
+   rollouts (positives = correct answers, negatives = wrong ones) with an
+   LSGAN objective. Its scores shape both the reward AND the inference-time
+   output gate (same criterion at train and test time).
+7) Optional latent loop: --loop-cycles N > 1 turns on the internal verification
+   loop; the efficiency term rewards thinking (more cycles) only when the
+   answer is actually correct.
+
 1 GPU:
 python -m scripts.chat_rl
 
@@ -22,9 +35,13 @@ import itertools
 import wandb
 import torch
 import torch.distributed as dist
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
-from nanochat.checkpoint_manager import save_checkpoint, load_model
-from nanochat.engine import Engine
+from FoxSay.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from FoxSay.checkpoint_manager import save_checkpoint, load_model
+from FoxSay.engine import Engine
+from FoxSay.gan import (
+    VerifierModel, VerifierTrainer, OutputGate, RewardConfig,
+    shape_reward, grpo_advantages, token_level_advantages, collate_turns,
+)
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -47,6 +64,19 @@ parser.add_argument("--num-samples", type=int, default=16, help="number of sampl
 parser.add_argument("--max-new-tokens", type=int, default=256, help="max tokens to generate per sample")
 parser.add_argument("--temperature", type=float, default=1.0, help="sampling temperature")
 parser.add_argument("--top-k", type=int, default=50, help="top-k sampling (0 = disabled)")
+# Internal verification loop + adversarial reward
+parser.add_argument("--loop-cycles", type=int, default=1, help="latent loop cycles for the policy (1 = legacy, no loop)")
+parser.add_argument("--verifier-embd", type=int, default=256, help="verifier embedding dim")
+parser.add_argument("--verifier-layer", type=int, default=4, help="verifier depth")
+parser.add_argument("--verifier-lr", type=float, default=1e-4, help="adversarial verifier learning rate")
+parser.add_argument("--gate-threshold", type=float, default=0.5, help="output gate accept threshold P(pass)")
+parser.add_argument("--gate-max-rejects", type=int, default=3, help="max gate rejections before releasing a turn")
+parser.add_argument("--use-output-gate", action="store_true", help="gate final outputs through the adversarial verifier at rollout time")
+# Reward shaping weights
+parser.add_argument("--w-process", type=float, default=0.25, help="weight of the PRM process reward")
+parser.add_argument("--w-adversarial", type=float, default=0.5, help="weight of the adversarial discriminator score")
+parser.add_argument("--w-efficiency", type=float, default=0.15, help="weight of the cycle-efficiency shaping")
+parser.add_argument("--w-truncation", type=float, default=-0.25, help="penalty for truncation (never zeroes the rest)")
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -68,11 +98,35 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="FoxSay-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
-engine = Engine(model, tokenizer) # for sampling rollouts
+# Turn on the internal verification loop for this run. Old checkpoints get the
+# gate grafted with neutral (no-op) values by _patch_missing_keys, so the run
+# starts bit-identical to the legacy model and the loop wakes up from data.
+if args.loop_cycles > 1 and getattr(model, "loop_gate", None) is None:
+    from FoxSay.gan import LoopGate
+    gate = LoopGate(model.config.n_embd, args.loop_cycles)
+    gate.init_weights()
+    model.loop_gate = gate  # neutral: cycle 1 halts, mix lambda = 0
+    model.config.loop_max_cycles = args.loop_cycles
+engine = Engine(model, tokenizer, output_gate=None) # for sampling rollouts (gate attached below if requested)
+
+# Adversarial verifier + output gate + reward config
+from FoxSay.gan import GPTConfigLite
+verifier = VerifierModel(GPTConfigLite(n_embd=args.verifier_embd, n_layer=args.verifier_layer, n_head=4, vocab_size=model.config.vocab_size))
+verifier.init_weights()
+verifier_trainer = VerifierTrainer(verifier, lr=args.verifier_lr, device=device)
+output_gate = OutputGate(verifier, gate_threshold=args.gate_threshold, max_rejects=args.gate_max_rejects) if args.use_output_gate else None
+reward_config = RewardConfig(
+    w_correct=1.0, w_process=args.w_process, w_adversarial=args.w_adversarial,
+    w_efficiency=args.w_efficiency, w_truncation=args.w_truncation,
+    max_cycles_budget=args.loop_cycles, target_cycles_fast=1,
+    truncation_limit=args.max_new_tokens,
+)
+if output_gate is not None:
+    engine.output_gate = output_gate
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -113,17 +167,45 @@ def get_batch():
             )
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
+        row_cycles = list(engine.row_cycles[:args.num_samples]) # latent cycles used per sample
 
         # Calculate the rewards for each sample
-        rewards = []
+        rewards_correct = []
+        generated_texts = []
         for sample_tokens in generated_token_sequences:
             # Get just the generated tokens (after the prompt)
             generated_tokens = sample_tokens[prefix_length:]
             # Decode the generated response
             generated_text = tokenizer.decode(generated_tokens)
-            # Calculate the reward
+            generated_texts.append(generated_text)
+            # Calculate the task outcome reward
             reward = train_task.reward(conversation, generated_text)
-            rewards.append(reward)
+            rewards_correct.append(float(reward))
+        r_correct = torch.tensor(rewards_correct, dtype=torch.float, device=device)
+
+        # Adversarial verifier scores the full turns (question + candidate answer)
+        turn_toks = [seq[:prefix_length] + seq[prefix_length:] for seq in generated_token_sequences]
+        turn_t = collate_turns(turn_toks, pad_id=tokenizer.get_bos_token_id(), device=device)
+        r_process = verifier.process_reward(turn_t) # (B,) tanh-bounded PRM score
+        _, turn_logit = verifier(turn_t)
+        p_pass = torch.sigmoid(turn_logit) # (B,) adversarial pass probability
+
+        # Train the verifier adversarially on THIS batch: positives are correct
+        # answers, negatives are wrong ones (LSGAN objective). This keeps the
+        # verifier in lockstep with the improving policy (no separate phase).
+        pos_toks = [t for t, r in zip(turn_toks, rewards_correct) if r >= 1.0]
+        neg_toks = [t for t, r in zip(turn_toks, rewards_correct) if r < 1.0]
+        if pos_toks and neg_toks:
+            verifier_trainer.train_batch(collate_turns(pos_toks, pad_id=tokenizer.get_bos_token_id(), device=device),
+                                         collate_turns(neg_toks, pad_id=tokenizer.get_bos_token_id(), device=device))
+
+        # Composite shaped reward (outcome + process + adversarial + efficiency,
+        # truncation penalized but never zeroing the process part)
+        truncated = torch.tensor(
+            [len(seq) - prefix_length >= args.max_new_tokens for seq in generated_token_sequences],
+            dtype=torch.bool, device=device)
+        cycle_counts = torch.tensor(row_cycles, dtype=torch.long, device=device)
+        rewards = shape_reward(r_correct, r_process, p_pass, cycle_counts, truncated, reward_config)
 
         # Pad the sequences so that their lengths (in time) match
         max_length = max(len(seq) for seq in generated_token_sequences)
@@ -138,10 +220,8 @@ def get_batch():
         targets[mask_ids[:, 1:] == 0] = -1 # <-- inplace modification right here. -1 is the ignore index
         # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
         # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
-        rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
-        mu = rewards.mean()
-        advantages = rewards - mu
+        # GRPO-style group-relative advantage: all samples of this example form one group
+        advantages = grpo_advantages(rewards, groups=torch.zeros_like(rewards, dtype=torch.long))
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
@@ -286,7 +366,9 @@ for step in range(num_steps):
         dist.all_reduce(mean_sequence_length_tensor, op=dist.ReduceOp.AVG)
         mean_reward = mean_reward_tensor.item()
         mean_sequence_length = mean_sequence_length_tensor.item()
-    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}")
+    gate_stats = getattr(engine, "gate_stats", None)
+    gate_str = f" | gate: {gate_stats}" if gate_stats is not None else ""
+    print0(f"Step {step}/{num_steps} | Average reward: {mean_reward} | Average sequence length: {mean_sequence_length:.2f}{gate_str}")
     wandb_run.log({
         "step": step,
         "reward": mean_reward,
@@ -320,7 +402,25 @@ for step in range(num_steps):
                 "model_config": model_config_kwargs,
             }
         )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        # Adversarial verifier checkpoint (loads in chat_cli.py via --verifier-path:
+        # {"config": GPTConfigLite kwargs, "state_dict": ...}). Saved in lockstep
+        # with the policy so the gate and the model it judges stay matched.
+        verifier_path = os.path.join(checkpoint_dir, "verifier.pt")
+        torch.save(
+            {
+                "config": {
+                    "n_embd": args.verifier_embd,
+                    "n_layer": args.verifier_layer,
+                    "n_head": 4,
+                    "max_chunk_tokens": verifier.config.max_chunk_tokens,
+                    "vocab_size": model.config.vocab_size,
+                },
+                "state_dict": verifier.state_dict(),
+                "step": step,
+            },
+            verifier_path,
+        )
+        print(f"✅ Saved model checkpoint to {checkpoint_dir} (verifier -> {verifier_path})")
 
 wandb_run.finish() # wandb run finish
 compute_cleanup()

@@ -1,7 +1,7 @@
 """
 Evaluate the Chat model.
 All the generic code lives here, and all the evaluation-specific
-code lives in nanochat directory and is imported from here.
+code lives in FoxSay directory and is imported from here.
 
 Example runs:
 python -m scripts.chat_eval -i sft -a ARC-Easy
@@ -13,9 +13,9 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from FoxSay.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from FoxSay.checkpoint_manager import load_model
+from FoxSay.engine import Engine
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU

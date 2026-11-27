@@ -6,9 +6,9 @@ python -m scripts.chat_cli
 """
 import argparse
 import torch
-from nanochat.common import compute_init, autodetect_device_type
-from nanochat.engine import Engine
-from nanochat.checkpoint_manager import load_model
+from FoxSay.common import compute_init, autodetect_device_type
+from FoxSay.engine import Engine
+from FoxSay.checkpoint_manager import load_model
 
 parser = argparse.ArgumentParser(description='Chat with the model')
 parser.add_argument('-i', '--source', type=str, default="sft", help="Source of the model: sft|rl")
@@ -18,6 +18,10 @@ parser.add_argument('-p', '--prompt', type=str, default='', help='Prompt the mod
 parser.add_argument('-t', '--temperature', type=float, default=0.6, help='Temperature for generation')
 parser.add_argument('-k', '--top-k', type=int, default=50, help='Top-k sampling parameter')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+# GAN output gate (see FoxSay/gan): verify candidate answers before release
+parser.add_argument('--verifier-path', type=str, default=None, help='Path to a trained verifier checkpoint (turns on the output gate)')
+parser.add_argument('--gate-threshold', type=float, default=0.5, help='Output gate accept threshold P(pass)')
+parser.add_argument('--gate-max-rejects', type=int, default=3, help='Max gate rejections before releasing a turn')
 args = parser.parse_args()
 
 # Init the model and tokenizer
@@ -26,15 +30,33 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
 
+# Optional adversarial output gate: candidate answers must pass the verifier
+# before <|assistant_end|> is allowed to release the turn (rejected turns keep
+# thinking; released anyway after max_rejects so chat never deadlocks).
+output_gate = None
+if args.verifier_path:
+    from FoxSay.gan import VerifierModel, GPTConfigLite, OutputGate
+    state = torch.load(args.verifier_path, map_location=device)
+    if isinstance(state, dict) and "config" in state:
+        vcfg = GPTConfigLite(**state["config"])
+        verifier = VerifierModel(vcfg)
+        verifier.load_state_dict(state["state_dict"])
+    else:
+        verifier = VerifierModel(GPTConfigLite(vocab_size=model.config.vocab_size))
+        verifier.load_state_dict(state)
+    verifier.to(device).eval()
+    output_gate = OutputGate(verifier, gate_threshold=args.gate_threshold, max_rejects=args.gate_max_rejects)
+    print(f"[gan] output gate ON: threshold={args.gate_threshold}, max_rejects={args.gate_max_rejects}")
+
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()
 user_start, user_end = tokenizer.encode_special("<|user_start|>"), tokenizer.encode_special("<|user_end|>")
 assistant_start, assistant_end = tokenizer.encode_special("<|assistant_start|>"), tokenizer.encode_special("<|assistant_end|>")
 
 # Create Engine for efficient generation
-engine = Engine(model, tokenizer)
+engine = Engine(model, tokenizer, output_gate=output_gate)
 
-print("\nNanoChat Interactive Mode")
+print("\nFoxSay Interactive Mode")
 print("-" * 50)
 print("Type 'quit' or 'exit' to end the conversation")
 print("Type 'clear' to start a new conversation")
@@ -72,6 +94,14 @@ while True:
     conversation_tokens.append(user_start)
     conversation_tokens.extend(tokenizer.encode(user_input))
     conversation_tokens.append(user_end)
+
+    # Keep the growing conversation within the model's context window: keep the
+    # BOS token plus the most recent tokens (sliding window). The conversation
+    # itself is never truncated by the tokenizer anymore (the 2048 cap is gone;
+    # only the model's own KV window applies, here).
+    max_context = model.config.sequence_len - 256 - 8  # leave room for the completion
+    if len(conversation_tokens) > max_context:
+        conversation_tokens = [conversation_tokens[0]] + conversation_tokens[-(max_context - 1):]
 
     # Kick off the assistant
     conversation_tokens.append(assistant_start)
